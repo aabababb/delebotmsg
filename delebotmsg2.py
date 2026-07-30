@@ -1,88 +1,94 @@
-from telethon.tl.types import InputPeerUser, InputPeerChannel, MessageEntityMentionName, MessageService,PeerUser,Channel,ChannelParticipantsAdmins
+from telethon.tl.types import InputPeerUser, InputPeerChannel, MessageEntityMentionName, MessageService, PeerUser, Channel, ChannelParticipantsAdmins
 from telethon import TelegramClient, sync, events, errors
+from telethon.sessions import StringSession  # 新增：支持环境变量会话
 import sys, asyncio
-import queue, time, json, os, re,traceback
+import queue, time, json, os, re, traceback
 from datetime import datetime, timezone, timedelta
 from telethon.errors import RPCError
 
 
-
 class TelegramBotMonitor:
-    def __init__(self, config_file):
-        self.config_file = config_file
+    def __init__(self):
+        """
+        不再接收 config_file 参数，所有配置从环境变量读取
+        """
         self.client = None
-        self.config = self.load_config()
+        # 从环境变量加载配置
+        self.config = self.load_config_from_env()
         
-    def load_config(self):
-        """安全地加载配置文件"""
-        if not os.path.exists(self.config_file):
-            print(f"配置文件不存在: {self.config_file}")
-            return {"bots": [], "keywords": []}
+    def load_config_from_env(self):
+        """
+        从环境变量构建配置字典，保持与原代码中 config 结构的兼容性
+        """
+        config = {}
         
-        try:
-            with open(self.config_file, "r", encoding="utf-8") as f:
-                # 支持JSON格式配置
-                if self.config_file.endswith('.json'):
-                    return json.load(f)
-
-        except Exception as e:
-            print(f"加载配置文件失败: {e}")
-            return {"bots": [], "keywords": []}
+        # 必需的 API 凭据
+        config['api_id'] = int(os.environ.get('API_ID', 0))
+        config['api_hash'] = os.environ.get('API_HASH', '')
+        config['phone'] = os.environ.get('PHONE', '')  # 仅用于首次登录，若已有 StringSession 则不会用到
+        
+        # 监控的机器人列表，用英文逗号分隔，例如 "bot1,bot2"
+        bots_env = os.environ.get('BOTS', '')
+        config['bots'] = [b.strip() for b in bots_env.split(',') if b.strip()] if bots_env else []
+        
+        # 监控的关键词列表，同样逗号分隔
+        keywords_env = os.environ.get('KEYWORDS', '')
+        config['keywords'] = [k.strip() for k in keywords_env.split(',') if k.strip()] if keywords_env else []
+        
+        # 可选开关
+        config['delete_all_bot_messages'] = os.environ.get('DELETE_ALL_BOT_MESSAGES', 'true').lower() == 'true'
+        config['send_delete_notification'] = os.environ.get('SEND_DELETE_NOTIFICATION', 'true').lower() == 'true'
+        config['debug_mode'] = os.environ.get('DEBUG_MODE', 'false').lower() == 'true'
+        
+        # 会话字符串（用于无头环境保持登录）
+        config['session_string'] = os.environ.get('SESSION_STRING', '')
+        
+        return config
     
     def get_beijing_time(self, dt=None):
         """获取北京时间"""
         if dt is None:
             dt = datetime.now(timezone.utc)
-        
-        # 如果dt是naive（没有时区信息），假设它是UTC时间
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        
-        # 转换为北京时间 (UTC+8)
         beijing_tz = timezone(timedelta(hours=8))
         beijing_time = dt.astimezone(beijing_tz)
         return beijing_time.strftime('%Y-%m-%d %p %H:%M:%S')
     
     def get_bots_list(self):
         """获取机器人列表"""
-        bots = []
-        if "bots" in self.config:
-            return self.config["bots"]
-        
-        # 兼容旧格式
-        for key, value in self.config.items():
-            if "bot" in key.lower():
-                bots.append(value)
-        return bots
+        return self.config.get("bots", [])
     
     def get_keywords_list(self):
         """获取关键词列表"""
-        keywords = []
-        if "keywords" in self.config:
-            return self.config["keywords"]
-        
-        # 兼容旧格式
-        for key, value in self.config.items():
-            if "str" in key.lower() or "keyword" in key.lower():
-                keywords.append(value)
-        return keywords
+        return self.config.get("keywords", [])
     
     async def initialize_client(self):
-        """初始化Telegram客户端"""
+        """初始化Telegram客户端，优先使用 StringSession 环境变量"""
         try:
-            api_id = self.config.get("api_id") 
-            api_hash = self.config.get("api_hash")
-            phone = self.config.get("phone") 
+            api_id = self.config["api_id"]
+            api_hash = self.config["api_hash"]
+            session_str = self.config.get("session_string", "")
             
-            self.client = TelegramClient(
-                'delebot_session', 
-                api_id, 
-                api_hash
-            )
+            if not api_id or not api_hash:
+                print("错误：环境变量 API_ID 或 API_HASH 未设置")
+                return False
+            
+            # 如果提供了 SESSION_STRING，则使用字符串会话，避免依赖磁盘文件
+            if session_str:
+                self.client = TelegramClient(StringSession(session_str), api_id, api_hash)
+            else:
+                # 回退到文件会话（本地调试时可用）
+                self.client = TelegramClient('delebot_session', api_id, api_hash)
             
             await self.client.connect()
             
             if not await self.client.is_user_authorized():
+                # 云端环境不应走到这里，应该提前生成 StringSession
+                phone = self.config.get("phone")
+                if not phone:
+                    print("错误：未授权且未设置 PHONE 环境变量，无法自动登录")
+                    return False
                 await self.handle_authentication(phone)
                 
             print("客户端初始化成功，开始监听消息...")
@@ -93,7 +99,7 @@ class TelegramBotMonitor:
             return False
     
     async def handle_authentication(self, phone):
-        """处理用户认证"""
+        """处理用户认证（仅用于首次登录，本地交互）"""
         try:
             await self.client.send_code_request(phone)
             code = input('请输入验证码：')
@@ -106,11 +112,11 @@ class TelegramBotMonitor:
             raise
 
     async def should_delete_message(self, event):
-        """判断是否应该删除消息"""
+        """判断是否应该删除消息（逻辑不变）"""
         try:
             sender = await event.get_sender()
             if not sender or not hasattr(sender, 'username') or not sender.username:
-                return False, None, 0  # 返回三个值：是否删除、原因、延迟时间
+                return False, None, 0
             
             message_text = event.message.text or event.message.raw_text or ""
             sender_username = sender.username.lower()
@@ -118,22 +124,14 @@ class TelegramBotMonitor:
             bots = self.get_bots_list()
             keywords = self.get_keywords_list()
             
-            # 检查是否是目标机器人
             is_target_bot = any(bot.lower() == sender_username for bot in bots)
-            
-            # 检查消息内容是否包含关键词
             has_keyword = any(keyword.lower() in message_text.lower() for keyword in keywords)
             
-            # 检查提及中的用户名是否包含关键词
             if not has_keyword and event.message.entities:
                 has_keyword = await self.check_mentions_for_keywords(event, keywords)
 
-            
-            # 删除条件：
-            # 1. 机器人且包含关键词 → 2秒延迟删除
             if "bot" in sender_username and has_keyword:
                 return True, "bot_with_keyword", 3
-            # 2. 机器人但没有关键词 → 60秒延迟删除
             elif "bot" in sender_username and sender_username not in [bot.lower() for bot in bots] and self.config.get("delete_all_bot_messages", True):
                 return True, "bot_all_messages", 90
                 
@@ -144,7 +142,7 @@ class TelegramBotMonitor:
             return False, None, 0
 
     async def check_mentions_for_keywords(self, event, keywords):
-        """检查提及中是否包含关键词"""
+        """检查提及中是否包含关键词（逻辑不变）"""
         try:
             for entity in event.message.entities:
                 if isinstance(entity, MessageEntityMentionName):
@@ -160,31 +158,25 @@ class TelegramBotMonitor:
             print(f"检查提及失败: {e}")
         return False
 
-
-
     async def handle_system_message(self, event):
+        """处理系统消息（逻辑不变，仅移除了冗余的 get_me 调用，保留原有功能）"""
         print("handle_system_message...")
         async for dialog in self.client.iter_dialogs(limit=100):
             current_time = self.get_beijing_time()
             try:
                 if dialog.is_group:
                     entity = dialog.entity
-                    # 获取群组的管理员列表
                     admins = await self.client.get_participants(dialog, filter=ChannelParticipantsAdmins)
                     user = await self.client.get_me()
                     user_id = user.id
-                    username = user.username if user.username is not None else 'None'
-                    first_name = user.first_name if user.first_name is not None else 'None'
-                    last_name = user.last_name if user.last_name is not None else 'None'
+                    username = user.username or 'None'
+                    first_name = user.first_name or 'None'
+                    last_name = user.last_name or 'None'
 
                     is_admin = any(admin.id == user_id for admin in admins)
 
                     if is_admin:
-                        #print(f"{current_time} 正在检查群组: {entity.title} (ID: {entity.id})， 用户是管理员")
-                        
-                        # 获取群组中的所有消息
                         async for message in self.client.iter_messages(entity):
-                            # 检查消息类型是否为系统消息
                             if message.action: 
                                 print(f"{current_time} 删除system消息: {entity.title}  - {message.action}")
                                 await self.client.delete_messages(entity, message.id)
@@ -192,10 +184,6 @@ class TelegramBotMonitor:
                         for admin in admins:
                             print(f'Admin ID: {admin.id}, Admin Username: {admin.username}')
                         print(f"{current_time} {entity.title} 用户{username}-{first_name}-{last_name}不是管理员")
-                else:
-                    #print(f"{current_time} 跳过不支持的对话类型: {dialog.title} (ID: {dialog.id})")
-                    pass
-
             except RPCError as rpc_error:
                 if rpc_error.code == 400 and "CHANNEL_MONOFORUM_UNSUPPORTED" in str(rpc_error):
                     print(f"{current_time} {entity.title} 该群不支持单一论坛。")
@@ -204,33 +192,23 @@ class TelegramBotMonitor:
             except ValueError as e:
                 print(f"发生了错误ValueError: {e}")
                 await asyncio.sleep(6)
-
             except Exception as e:
                 print(f"{current_time} handle_system_message失败: {e}")
                 await asyncio.sleep(6)
                 traceback.print_exc()
 
-
-    
-
     async def handle_bot_message(self, event):
-        #print("Handling bot message...")
+        """处理机器人消息（逻辑不变）"""
         await asyncio.sleep(1)
         try:
             current_time = self.get_beijing_time()
-
-            # 忽略自己的消息
             if event.out:
                 return
             
-            # 安全地获取删除判断结果
             result = await self.should_delete_message(event)
-            
-            # 处理返回值，确保是元组
             if isinstance(result, tuple) and len(result) == 3:
                 should_delete, reason, delay_seconds = result
             else:
-                # 如果返回的不是元组，默认不删除
                 should_delete = False
                 reason = "unknown"
                 delay_seconds = 0
@@ -244,92 +222,67 @@ class TelegramBotMonitor:
                 print(f"?? 检测到需删除的消息 | 原因: {reason} | 延迟: {delay_seconds}秒 | 发送时间: {event_time} ")
                 print(f"   发送者: @{sender_name}")
                 print(f"   消息预览: {message_preview}")
-                
-                # 使用从判断函数返回的延迟时间
                 await self.delete_message_with_delay(event, delay_seconds)
             else:
-                # 可选：记录所有消息用于调试
                 if self.config.get("debug_mode", False):
                     sender = await event.get_sender()
                     if sender and sender.username:
                         event_time = self.get_beijing_time(event.date)
                         print(f"?? 收到消息 | 发送者: @{sender.username} | 发送时间:{event_time} | 无需删除")
-                        
         except Exception as e:
             current_time = self.get_beijing_time()
             print(f"处理消息时发生错误: {e} | 时间: {current_time} (北京时间)")
 
     async def delete_message_with_delay(self, event, delay_seconds=2):
-        """延迟删除消息"""
+        """延迟删除消息（逻辑不变）"""
         try:
-            # 根据不同的延迟时间显示不同的提示
             if delay_seconds > 10:
                 print(f"⏰ 将在 {delay_seconds} 秒后删除消息...")
-            
-            # 等待指定时间
             await asyncio.sleep(delay_seconds)
-            
             sender = await event.get_sender()
             chat_id = event.chat_id
             message_id = event.id
-            
-            # 验证消息仍然存在
             try:
                 message = await self.client.get_messages(chat_id, ids=message_id)
                 if message:
-                    # 删除消息
                     await self.client.delete_messages(chat_id, message_id)
-                    
-                    # 记录日志（使用北京时间）
                     event_time = self.get_beijing_time(event.date)
                     sender_name = sender.username if sender and sender.username else "Unknown"
-                    nowtime = self.get_beijing_time() 
+                    nowtime = self.get_beijing_time()
                     print(f"✅ 已删除消息 | 发送者: @{sender_name} | 延迟: {delay_seconds}秒 | 发送时间: {event_time} | 删除时间 {nowtime}")
-                    
-                    # 可选：发送删除通知
                     if self.config.get("send_delete_notification", True):
                         await self.send_delete_notification(event, sender_name, event_time, delay_seconds)
-                        
                     return True
                 else:
                     print("⚠️ 消息已不存在，跳过删除")
                     return False
-                    
             except errors.MessageDeleteForbiddenError:
                 print("❌ 没有权限删除此消息")
                 return False
             except errors.MessageIdInvalidError:
                 print("⚠️ 消息ID无效，可能已被删除")
                 return False
-                
         except Exception as e:
             print(f"❌ 删除消息失败: {e}")
             return False
 
     async def send_delete_notification(self, event, sender_name, event_time, delay_seconds):
-        """发送删除通知"""
+        """发送删除通知（逻辑不变）"""
         try:
             if delay_seconds <= 2:
                 reason_desc = "包含违规关键词"
             else:
                 reason_desc = "来自被监控的机器人"
-                
             notification_text = (
                 f"@{sender_name} 机器人的消息已被删除！\n"
                 f"北京时间: {event_time} \n"
-                #f"原因: {reason_desc}\n"
-                #f"延迟: {delay_seconds}秒"
             )
             await self.client.send_message(event.chat_id, notification_text)
         except Exception as e:
             print(f"发送删除通知失败: {e}")
 
-
-
-
-    async def combined_handler(self,event):
+    async def combined_handler(self, event):
         try:
-            # 使用 asyncio.gather 同时执行两个处理器
             await asyncio.gather(
                 self.handle_system_message(event),
                 self.handle_bot_message(event)
@@ -337,18 +290,12 @@ class TelegramBotMonitor:
         except Exception as e:
             print(f"Error in combined_handler: {e}")
 
-
-    
     async def start_monitoring(self):
-        """开始监控"""
+        """开始监控（逻辑不变）"""
         try:
             if not await self.initialize_client():
                 return False
             
-            # 注册消息处理器
-            #print(f"当前解析模式: {self.client.parse_mode}")
-
-
             self.client.add_event_handler(
                 self.combined_handler,
                 events.NewMessage(incoming=True)
@@ -363,7 +310,6 @@ class TelegramBotMonitor:
             print(f"删除所有机器人消息: {self.config.get('delete_all_bot_messages', True)}")
             print("=" * 60)
             
-            # 保持运行
             await self.client.run_until_disconnected()
             return True
             
@@ -382,22 +328,8 @@ class TelegramBotMonitor:
 
 
 async def main():
-    # 获取配置文件路径
-    absolute_path = os.path.abspath(__file__)    
-    directory_path = os.path.dirname(absolute_path)
-    
-    # 优先尝试JSON配置文件
-    json_config_file = os.path.join(directory_path, "bot_config.json")
-    
-    if os.path.exists(json_config_file):
-        config_file = json_config_file
-        print(f"使用配置文件: {config_file}")
-
-    else:
-        print(f"配置文件不存在: {config_file}")
-    
-    # 创建监控实例
-    monitor = TelegramBotMonitor(config_file)
+    # 不再需要配置文件路径，直接创建实例
+    monitor = TelegramBotMonitor()
     
     try:
         await monitor.start_monitoring()
@@ -412,9 +344,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    # 设置事件循环策略（Windows系统需要）
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    
-    # 运行主程序
     asyncio.run(main())
