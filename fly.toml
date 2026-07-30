@@ -15,6 +15,7 @@ kill_timeout = '5s'
 
 [http_service]
   internal_port = 8080
+  http_checks = []
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
