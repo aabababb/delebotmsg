@@ -1,0 +1,6 @@
+app = "delebotmsg"
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[processes]
+  app = "python delebotmsg2.py"
