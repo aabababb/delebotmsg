@@ -366,8 +366,9 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
 def start_http_server(web_passwd):
     # 将密码传入 Handler 类
     StatusHandler.web_passwd = web_passwd
-    server = http.server.HTTPServer(('localhost', 8080), StatusHandler)
-    log("HTTP 状态服务已启动：http://localhost:8080/status?pass=你的密码")
+    port = int(os.environ.get('PORT', 8080))
+    server = http.server.HTTPServer(('0.0.0.0', port), StatusHandler)
+    log("HTTP 状态服务已启动：http://localhost:{port}/status?pass=你的密码")
     server.serve_forever()
 
 
