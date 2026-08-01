@@ -4,7 +4,7 @@ from telethon.tl.types import (
 )
 from telethon import TelegramClient, sync, events, errors
 from telethon.errors import RPCError
-from telethon.sessions import StringSession          # StringSession 支持
+from telethon.sessions import StringSession
 import sys, asyncio
 import queue, time, json, os, re, traceback
 from datetime import datetime, timezone, timedelta
@@ -32,6 +32,8 @@ class TelegramBotMonitor:
         self.config_file = config_file
         self.client = None
         self.config = self.load_config()
+        # 限制同时处理的消息数，避免高并发时资源耗尽
+        self.semaphore = asyncio.Semaphore(5)
 
     def load_config(self):
         if not os.path.exists(self.config_file):
@@ -101,8 +103,6 @@ class TelegramBotMonitor:
         except Exception as e:
             log(f"初始化客户端失败: {e}")
             return False
-
-    # 移除 handle_authentication 方法（不再需要）
 
     async def should_delete_message(self, event):
         try:
@@ -281,13 +281,16 @@ class TelegramBotMonitor:
             log(f"发送删除通知失败: {e}")
 
     async def combined_handler(self, event):
-        try:
-            await asyncio.gather(
-                self.handle_system_message(event),
-                self.handle_bot_message(event)
-            )
-        except Exception as e:
-            log(f"Error in combined_handler: {e}")
+        """限制并发处理数量的消息入口"""
+        # 使用信号量限制同时处理的事件数
+        async with self.semaphore:
+            try:
+                await asyncio.gather(
+                    self.handle_system_message(event),
+                    self.handle_bot_message(event)
+                )
+            except Exception as e:
+                log(f"Error in combined_handler: {e}")
 
     async def start_monitoring(self):
         try:
@@ -368,7 +371,8 @@ def start_http_server(web_passwd):
     StatusHandler.web_passwd = web_passwd
     port = int(os.environ.get('PORT', 8080))
     server = http.server.HTTPServer(('0.0.0.0', port), StatusHandler)
-    log("HTTP 状态服务已启动：http://localhost:{port}/status?pass=你的密码")
+    # 修正日志输出中的 URL 显示
+    log(f"HTTP 状态服务已启动，监听 0.0.0.0:{port}，访问 /status?pass=你的密码")
     server.serve_forever()
 
 
