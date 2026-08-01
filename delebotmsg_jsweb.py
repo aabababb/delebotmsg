@@ -369,7 +369,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
 def start_http_server(web_passwd):
     # 将密码传入 Handler 类
     StatusHandler.web_passwd = web_passwd
-    port = int(os.environ.get('PORT', 8080))
+    port = int(os.environ.get('PORT', 10000))
     server = http.server.HTTPServer(('0.0.0.0', port), StatusHandler)
     # 修正日志输出中的 URL 显示
     log(f"HTTP 状态服务已启动，监听 0.0.0.0:{port}，访问 /status?pass=你的密码")
