@@ -341,7 +341,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             pass_input = qs.get('pass', [None])[0]
 
             if self.web_passwd and pass_input != self.web_passwd:
-                self.send_response(403)
+                self.send_response(200)
                 self.send_header('Content-type', 'text/plain; charset=utf-8')
                 self.end_headers()
                 self.wfile.write("密码错误，拒绝访问\n".encode('utf-8'))
