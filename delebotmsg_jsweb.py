@@ -32,7 +32,7 @@ class TelegramBotMonitor:
         self.config_file = config_file
         self.client = None
         self.config = self.load_config()
-        # 限制同时处理的消息数，避免高并发时资源耗尽
+        # 限制同时处理的机器人消息数，避免高并发时资源耗尽
         self.semaphore = asyncio.Semaphore(5)
 
     def load_config(self):
@@ -85,7 +85,6 @@ class TelegramBotMonitor:
             if not string_session:
                 raise Exception("配置文件中缺少 string_session 字段，请提供有效的 StringSession")
 
-            # 使用 StringSession 创建客户端
             self.client = TelegramClient(
                 StringSession(string_session),
                 api_id,
@@ -150,8 +149,9 @@ class TelegramBotMonitor:
             log(f"检查提及失败: {e}")
         return False
 
-    async def handle_system_message(self, event):
-        log("handle_system_message...")
+    async def handle_system_message_once(self):
+        """定时清理系统消息（例如入群/退群通知）"""
+        log("开始定时清理系统消息...")
         async for dialog in self.client.iter_dialogs(limit=100):
             current_time = self.get_beijing_time()
             try:
@@ -169,12 +169,10 @@ class TelegramBotMonitor:
                     if is_admin:
                         async for message in self.client.iter_messages(entity):
                             if message.action:
-                                log(f"{current_time} 删除system消息: {entity.title}  - {message.action}")
+                                log(f"{current_time} 删除系统消息: {entity.title}  - {message.action}")
                                 await self.client.delete_messages(entity, message.id)
                     else:
-                        for admin in admins:
-                            log(f'Admin ID: {admin.id}, Admin Username: {admin.username}')
-                        log(f"{current_time} {entity.title} 用户{username}-{first_name}-{last_name}不是管理员")
+                        log(f"{current_time} {entity.title} 用户{username}-{first_name}-{last_name}不是管理员，跳过")
                 else:
                     pass
 
@@ -187,47 +185,59 @@ class TelegramBotMonitor:
                 log(f"发生了错误ValueError: {e}")
                 await asyncio.sleep(6)
             except Exception as e:
-                log(f"{current_time} handle_system_message失败: {e}")
+                log(f"{current_time} 系统消息清理失败: {e}")
                 await asyncio.sleep(6)
                 traceback.print_exc()
+        log("系统消息清理完成")
+
+    async def periodic_system_cleanup(self):
+        """后台任务：每隔 30 分钟执行一次系统消息清理"""
+        while True:
+            await asyncio.sleep(1800)   # 30 分钟
+            try:
+                await self.handle_system_message_once()
+            except Exception as e:
+                log(f"定时系统清理出错: {e}")
 
     async def handle_bot_message(self, event):
-        await asyncio.sleep(1)
-        try:
-            current_time = self.get_beijing_time()
-            if event.out:
-                return
+        """处理机器人消息（带并发控制）"""
+        async with self.semaphore:      # 限制同时处理的消息数量
+            await asyncio.sleep(1)
+            try:
+                current_time = self.get_beijing_time()
+                if event.out:
+                    return
 
-            result = await self.should_delete_message(event)
+                result = await self.should_delete_message(event)
 
-            if isinstance(result, tuple) and len(result) == 3:
-                should_delete, reason, delay_seconds = result
-            else:
-                should_delete = False
-                reason = "unknown"
-                delay_seconds = 0
-                log(f"⚠️ should_delete_message 返回了意外的格式: {result}")
+                if isinstance(result, tuple) and len(result) == 3:
+                    should_delete, reason, delay_seconds = result
+                else:
+                    should_delete = False
+                    reason = "unknown"
+                    delay_seconds = 0
+                    log(f"⚠️ should_delete_message 返回了意外的格式: {result}")
 
-            if should_delete:
-                sender = await event.get_sender()
-                sender_name = sender.username if sender and sender.username else "Unknown"
-                message_preview = event.message.text[:50] + "..." if event.message.text and len(event.message.text) > 50 else event.message.text
-                event_time = self.get_beijing_time(event.date)
-                log(f"?? 检测到需删除的消息 | 原因: {reason} | 延迟: {delay_seconds}秒 | 发送时间: {event_time} ")
-                log(f"   发送者: @{sender_name}")
-                log(f"   消息预览: {message_preview}")
-
-                await self.delete_message_with_delay(event, delay_seconds)
-            else:
-                if self.config.get("debug_mode", False):
+                if should_delete:
                     sender = await event.get_sender()
-                    if sender and sender.username:
-                        event_time = self.get_beijing_time(event.date)
-                        log(f"?? 收到消息 | 发送者: @{sender.username} | 发送时间:{event_time} | 无需删除")
+                    sender_name = sender.username if sender and sender.username else "Unknown"
+                    message_preview = event.message.text[:50] + "..." if event.message.text and len(event.message.text) > 50 else event.message.text
+                    event_time = self.get_beijing_time(event.date)
+                    log(f"?? 检测到需删除的消息 | 原因: {reason} | 延迟: {delay_seconds}秒 | 发送时间: {event_time} ")
+                    log(f"   发送者: @{sender_name}")
+                    log(f"   消息预览: {message_preview}")
 
-        except Exception as e:
-            current_time = self.get_beijing_time()
-            log(f"处理消息时发生错误: {e} | 时间: {current_time} (北京时间)")
+                    await self.delete_message_with_delay(event, delay_seconds)
+                else:
+                    if self.config.get("debug_mode", False):
+                        sender = await event.get_sender()
+                        if sender and sender.username:
+                            event_time = self.get_beijing_time(event.date)
+                            log(f"?? 收到消息 | 发送者: @{sender.username} | 发送时间:{event_time} | 无需删除")
+
+            except Exception as e:
+                current_time = self.get_beijing_time()
+                log(f"处理消息时发生错误: {e} | 时间: {current_time} (北京时间)")
 
     async def delete_message_with_delay(self, event, delay_seconds=2):
         try:
@@ -280,27 +290,19 @@ class TelegramBotMonitor:
         except Exception as e:
             log(f"发送删除通知失败: {e}")
 
-    async def combined_handler(self, event):
-        """限制并发处理数量的消息入口"""
-        # 使用信号量限制同时处理的事件数
-        async with self.semaphore:
-            try:
-                await asyncio.gather(
-                    self.handle_system_message(event),
-                    self.handle_bot_message(event)
-                )
-            except Exception as e:
-                log(f"Error in combined_handler: {e}")
-
     async def start_monitoring(self):
         try:
             if not await self.initialize_client():
                 return False
 
+            # 只注册轻量的机器人消息处理器
             self.client.add_event_handler(
-                self.combined_handler,
+                self.handle_bot_message,
                 events.NewMessage(incoming=True)
             )
+
+            # 启动后台定时系统消息清理任务
+            asyncio.create_task(self.periodic_system_cleanup())
 
             current_time = self.get_beijing_time()
             log("=" * 60)
@@ -329,13 +331,12 @@ class TelegramBotMonitor:
 
 # ========== HTTP 状态服务 ==========
 class StatusHandler(http.server.BaseHTTPRequestHandler):
-    # 此处通过类属性传递密码，在启动服务器前设置
+    # 通过类属性传递密码，在启动服务器前设置
     web_passwd = None
 
     def do_GET(self):
         parsed_path = urlparse(self.path)
         if parsed_path.path == '/status':
-            # 解析查询参数
             qs = parse_qs(parsed_path.query)
             pass_input = qs.get('pass', [None])[0]
 
@@ -367,11 +368,9 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_http_server(web_passwd):
-    # 将密码传入 Handler 类
     StatusHandler.web_passwd = web_passwd
     port = int(os.environ.get('PORT', 10000))
     server = http.server.HTTPServer(('0.0.0.0', port), StatusHandler)
-    # 修正日志输出中的 URL 显示
     log(f"HTTP 状态服务已启动，监听 0.0.0.0:{port}，访问 /status?pass=你的密码")
     server.serve_forever()
 
@@ -389,7 +388,7 @@ async def main():
         log(f"配置文件不存在: {json_config_file}")
         return
 
-    # 提前读取密码（不从 monitor 实例重复加载）
+    # 提前读取密码
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             config = json.load(f)
