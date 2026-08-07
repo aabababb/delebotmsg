@@ -115,18 +115,25 @@ class TelegramBotMonitor:
             bots = self.get_bots_list()
             keywords = self.get_keywords_list()
 
-            is_target_bot = any(bot.lower() == sender_username for bot in bots)
-
+            # 判断是否包含关键词
             has_keyword = any(keyword.lower() in message_text.lower() for keyword in keywords)
-
             if not has_keyword and event.message.entities:
                 has_keyword = await self.check_mentions_for_keywords(event, keywords)
 
-            if "bot" in sender_username and has_keyword:
+            # 只处理机器人消息
+            if "bot" not in sender_username:
+                return False, None, 0
+
+            # 1. 任何机器人消息只要含关键词，一律删除（包括白名单）
+            if has_keyword:
                 return True, "bot_with_keyword", 3
-            elif "bot" in sender_username and sender_username not in [bot.lower() for bot in bots] and self.config.get("delete_all_bot_messages", True):
+
+            # 2. 不含关键词时：删除所有非白名单机器人的消息（如果开关开启）
+            is_whitelisted = sender_username in [b.lower() for b in bots]
+            if not is_whitelisted and self.config.get("delete_all_bot_messages", True):
                 return True, "bot_all_messages", 90
 
+            # 3. 不含关键词 + 白名单机器人 → 不删除
             return False, None, 0
 
         except Exception as e:
