@@ -57,14 +57,25 @@ class TelegramBotMonitor:
         beijing_time = dt.astimezone(beijing_tz)
         return beijing_time.strftime('%Y-%m-%d %p %H:%M:%S')
 
+
+
     def get_bots_list(self):
-        if "bots" in self.config:
-            return self.config["bots"]
         bots = []
-        for key, value in self.config.items():
-            if "bot" in key.lower():
-                bots.append(value)
-        return bots
+        if "bots" in self.config:
+            bots = self.config["bots"]
+        else:
+            for key, value in self.config.items():
+                if "bot" in key.lower():
+                    bots.append(value)
+
+        # 统一清理：去空格、去 @ 前缀、转小写
+        cleaned = []
+        for b in bots:
+            b = str(b).strip().lstrip('@').lower()
+            if b:
+                cleaned.append(b)
+        return cleaned
+
 
     def get_keywords_list(self):
         if "keywords" in self.config:
