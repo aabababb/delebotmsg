@@ -32,14 +32,12 @@ class TelegramBotMonitor:
         self.config_file = config_file
         self.client = None
         self.config = self.load_config()
-        # 限制同时处理的机器人消息数，避免高并发时资源耗尽
         self.semaphore = asyncio.Semaphore(5)
 
     def load_config(self):
         if not os.path.exists(self.config_file):
             log(f"配置文件不存在: {self.config_file}")
             return {"bots": [], "keywords": []}
-
         try:
             with open(self.config_file, "r", encoding="utf-8") as f:
                 if self.config_file.endswith('.json'):
@@ -57,8 +55,6 @@ class TelegramBotMonitor:
         beijing_time = dt.astimezone(beijing_tz)
         return beijing_time.strftime('%Y-%m-%d %p %H:%M:%S')
 
-
-
     def get_bots_list(self):
         bots = []
         if "bots" in self.config:
@@ -67,15 +63,13 @@ class TelegramBotMonitor:
             for key, value in self.config.items():
                 if "bot" in key.lower():
                     bots.append(value)
-
-        # 统一清理：去空格、去 @ 前缀、转小写
+        # 清理@符号和空格，统一小写
         cleaned = []
         for b in bots:
             b = str(b).strip().lstrip('@').lower()
             if b:
                 cleaned.append(b)
         return cleaned
-
 
     def get_keywords_list(self):
         if "keywords" in self.config:
@@ -87,29 +81,18 @@ class TelegramBotMonitor:
         return keywords
 
     async def initialize_client(self):
-        """使用 StringSession 初始化客户端，不再需要交互式登录"""
         try:
             api_id = self.config.get("api_id")
             api_hash = self.config.get("api_hash")
             string_session = self.config.get("string_session")
-
             if not string_session:
-                raise Exception("配置文件中缺少 string_session 字段，请提供有效的 StringSession")
-
-            self.client = TelegramClient(
-                StringSession(string_session),
-                api_id,
-                api_hash
-            )
-
+                raise Exception("配置文件中缺少 string_session 字段")
+            self.client = TelegramClient(StringSession(string_session), api_id, api_hash)
             await self.client.connect()
-
             if not await self.client.is_user_authorized():
-                raise Exception("StringSession 无效或已过期，请更新配置文件中的 string_session")
-
+                raise Exception("StringSession 无效或已过期")
             log("客户端初始化成功，开始监听消息...")
             return True
-
         except Exception as e:
             log(f"初始化客户端失败: {e}")
             return False
@@ -122,31 +105,17 @@ class TelegramBotMonitor:
 
             message_text = event.message.text or event.message.raw_text or ""
             sender_username = sender.username.lower()
-
             bots = self.get_bots_list()
             keywords = self.get_keywords_list()
-
-            # 判断是否包含关键词
             has_keyword = any(keyword.lower() in message_text.lower() for keyword in keywords)
             if not has_keyword and event.message.entities:
                 has_keyword = await self.check_mentions_for_keywords(event, keywords)
 
-            # 只处理机器人消息
-            if "bot" not in sender_username:
-                return False, None, 0
-
-            # 1. 任何机器人消息只要含关键词，一律删除（包括白名单）
-            if has_keyword:
+            if "bot" in sender_username and has_keyword:
                 return True, "bot_with_keyword", 3
-
-            # 2. 不含关键词时：删除所有非白名单机器人的消息（如果开关开启）
-            is_whitelisted = sender_username in [b.lower() for b in bots]
-            if not is_whitelisted and self.config.get("delete_all_bot_messages", True):
+            elif "bot" in sender_username and sender_username not in bots and self.config.get("delete_all_bot_messages", True):
                 return True, "bot_all_messages", 90
-
-            # 3. 不含关键词 + 白名单机器人 → 不删除
             return False, None, 0
-
         except Exception as e:
             log(f"判断消息删除条件失败: {e}")
             return False, None, 0
@@ -168,7 +137,7 @@ class TelegramBotMonitor:
         return False
 
     async def handle_system_message_once(self):
-        """定时清理系统消息（例如入群/退群通知）"""
+        """定时清理系统消息（入群/退群等）"""
         log("开始定时清理系统消息...")
         async for dialog in self.client.iter_dialogs(limit=100):
             current_time = self.get_beijing_time()
@@ -178,132 +147,138 @@ class TelegramBotMonitor:
                     admins = await self.client.get_participants(dialog, filter=ChannelParticipantsAdmins)
                     user = await self.client.get_me()
                     user_id = user.id
-                    username = user.username if user.username is not None else 'None'
-                    first_name = user.first_name if user.first_name is not None else 'None'
-                    last_name = user.last_name if user.last_name is not None else 'None'
-
                     is_admin = any(admin.id == user_id for admin in admins)
-
                     if is_admin:
                         async for message in self.client.iter_messages(entity):
                             if message.action:
-                                log(f"{current_time} 删除系统消息: {entity.title}  - {message.action}")
+                                log(f"{current_time} 删除系统消息: {entity.title} - {message.action}")
                                 await self.client.delete_messages(entity, message.id)
                     else:
-                        log(f"{current_time} {entity.title} 用户{username}-{first_name}-{last_name}不是管理员，跳过")
-                else:
-                    pass
-
-            except RPCError as rpc_error:
-                if rpc_error.code == 400 and "CHANNEL_MONOFORUM_UNSUPPORTED" in str(rpc_error):
-                    log(f"{current_time} {entity.title} 该群不支持单一论坛。")
-                else:
-                    log(f"{current_time} {entity.title} 处理RPC错误: {rpc_error}")
-            except ValueError as e:
-                log(f"发生了错误ValueError: {e}")
-                await asyncio.sleep(6)
+                        log(f"{current_time} {entity.title} 不是管理员，跳过清理")
+            except RPCError as e:
+                log(f"{current_time} RPC错误: {e}")
             except Exception as e:
                 log(f"{current_time} 系统消息清理失败: {e}")
-                await asyncio.sleep(6)
-                traceback.print_exc()
         log("系统消息清理完成")
 
     async def periodic_system_cleanup(self):
-        """后台任务：每隔 30 分钟执行一次系统消息清理"""
         while True:
-            await asyncio.sleep(1800)   # 30 分钟
+            await asyncio.sleep(1800)
             try:
                 await self.handle_system_message_once()
             except Exception as e:
-                log(f"定时系统清理出错: {e}")
+                log(f"定时清理出错: {e}")
+
+    # ==================== 新增功能：踢除非管理员邀请的机器人 ====================
+    async def handle_new_member(self, event):
+        """
+        当有新成员加入群组时，如果是机器人且邀请者不是管理员，则踢出该机器人
+        """
+        # 只处理群聊中的加入事件
+        if not event.is_group:
+            return
+
+        # 只关注加入的新成员（包括自己加入）
+        if not event.added_by:
+            return
+
+        # 获取新加入的成员列表
+        for user in event.added_users:
+            if not user.bot:
+                continue  # 不是机器人，忽略
+
+            chat = await event.get_chat()
+            inviter_id = event.added_by
+            try:
+                inviter = await self.client.get_entity(inviter_id)
+            except:
+                log(f"无法获取邀请者信息: {inviter_id}")
+                continue
+
+            # 检查邀请者是否是管理员
+            try:
+                admins = await self.client.get_participants(chat, filter=ChannelParticipantsAdmins)
+                admin_ids = [admin.id for admin in admins]
+                is_inviter_admin = inviter.id in admin_ids
+            except Exception as e:
+                log(f"获取管理员列表失败: {e}")
+                continue
+
+            if not is_inviter_admin:
+                # 不是管理员邀请的机器人，执行踢出
+                try:
+                    await self.client.kick_participant(chat, user)
+                    log(f"✅ 已踢出非管理员邀请的机器人: @{user.username or user.id} (邀请者: @{inviter.username or inviter.id})")
+                except errors.ChatAdminRequiredError:
+                    log(f"❌ 无权限踢人，请确保本机器人是群组管理员且有封禁权限")
+                except Exception as e:
+                    log(f"❌ 踢出机器人失败: {e}")
+    # ========================================================================
 
     async def handle_bot_message(self, event):
-        """处理机器人消息（带并发控制）"""
-        async with self.semaphore:      # 限制同时处理的消息数量
+        async with self.semaphore:
             await asyncio.sleep(1)
             try:
-                current_time = self.get_beijing_time()
                 if event.out:
                     return
-
                 result = await self.should_delete_message(event)
-
                 if isinstance(result, tuple) and len(result) == 3:
                     should_delete, reason, delay_seconds = result
                 else:
                     should_delete = False
                     reason = "unknown"
                     delay_seconds = 0
-                    log(f"⚠️ should_delete_message 返回了意外的格式: {result}")
-
                 if should_delete:
                     sender = await event.get_sender()
                     sender_name = sender.username if sender and sender.username else "Unknown"
                     message_preview = event.message.text[:50] + "..." if event.message.text and len(event.message.text) > 50 else event.message.text
                     event_time = self.get_beijing_time(event.date)
-                    log(f"?? 检测到需删除的消息 | 原因: {reason} | 延迟: {delay_seconds}秒 | 发送时间: {event_time} ")
-                    log(f"   发送者: @{sender_name}")
-                    log(f"   消息预览: {message_preview}")
-
+                    log(f"检测到需删除的消息 | 原因: {reason} | 延迟: {delay_seconds}秒 | 发送时间: {event_time}")
+                    log(f"   发送者: @{sender_name} | 预览: {message_preview}")
                     await self.delete_message_with_delay(event, delay_seconds)
-                else:
-                    if self.config.get("debug_mode", False):
-                        sender = await event.get_sender()
-                        if sender and sender.username:
-                            event_time = self.get_beijing_time(event.date)
-                            log(f"?? 收到消息 | 发送者: @{sender.username} | 发送时间:{event_time} | 无需删除")
-
+                elif self.config.get("debug_mode", False):
+                    sender = await event.get_sender()
+                    if sender and sender.username:
+                        event_time = self.get_beijing_time(event.date)
+                        log(f"收到消息 | 发送者: @{sender.username} | 时间:{event_time} | 无需删除")
             except Exception as e:
-                current_time = self.get_beijing_time()
-                log(f"处理消息时发生错误: {e} | 时间: {current_time} (北京时间)")
+                log(f"处理消息时发生错误: {e}")
 
     async def delete_message_with_delay(self, event, delay_seconds=2):
         try:
             if delay_seconds > 10:
-                log(f"⏰ 将在 {delay_seconds} 秒后删除消息...")
-
+                log(f"将在 {delay_seconds} 秒后删除消息...")
             await asyncio.sleep(delay_seconds)
-
             sender = await event.get_sender()
             chat_id = event.chat_id
             message_id = event.id
-
             try:
                 message = await self.client.get_messages(chat_id, ids=message_id)
                 if message:
                     await self.client.delete_messages(chat_id, message_id)
-
                     event_time = self.get_beijing_time(event.date)
                     sender_name = sender.username if sender and sender.username else "Unknown"
                     nowtime = self.get_beijing_time()
                     log(f"✅ 已删除消息 | 发送者: @{sender_name} | 延迟: {delay_seconds}秒 | 发送时间: {event_time} | 删除时间 {nowtime}")
-
                     if self.config.get("send_delete_notification", True):
                         await self.send_delete_notification(event, sender_name, event_time, delay_seconds)
-
                     return True
                 else:
-                    log("⚠️ 消息已不存在，跳过删除")
+                    log("消息已不存在，跳过删除")
                     return False
-
             except errors.MessageDeleteForbiddenError:
-                log("❌ 没有权限删除此消息")
+                log("没有权限删除此消息")
                 return False
             except errors.MessageIdInvalidError:
-                log("⚠️ 消息ID无效，可能已被删除")
+                log("消息ID无效，可能已被删除")
                 return False
-
         except Exception as e:
-            log(f"❌ 删除消息失败: {e}")
+            log(f"删除消息失败: {e}")
             return False
 
     async def send_delete_notification(self, event, sender_name, event_time, delay_seconds):
         try:
-            reason_desc = "包含违规关键词" if delay_seconds <= 2 else "来自被监控的机器人"
-            notification_text = (
-                f"@{sender_name} 机器人的消息已被删除！\n"
-                f"北京时间: {event_time} \n"
-            )
+            notification_text = f"@{sender_name} 机器人的消息已被删除！\n北京时间: {event_time}\n"
             await self.client.send_message(event.chat_id, notification_text)
         except Exception as e:
             log(f"发送删除通知失败: {e}")
@@ -313,13 +288,23 @@ class TelegramBotMonitor:
             if not await self.initialize_client():
                 return False
 
-            # 只注册轻量的机器人消息处理器
+            # 原有机器人消息处理器
             self.client.add_event_handler(
                 self.handle_bot_message,
                 events.NewMessage(incoming=True)
             )
 
-            # 启动后台定时系统消息清理任务
+            # ========== 新增事件处理器：新成员加入 ==========
+            # 根据配置决定是否启用踢出非管理员邀请的机器人（默认开启）
+            if self.config.get("kick_unauthorized_bots", True):
+                self.client.add_event_handler(
+                    self.handle_new_member,
+                    events.ChatAction
+                )
+                log("已启用「踢除非管理员邀请的机器人」功能")
+            # ===============================================
+
+            # 后台定时系统消息清理
             asyncio.create_task(self.periodic_system_cleanup())
 
             current_time = self.get_beijing_time()
@@ -333,10 +318,8 @@ class TelegramBotMonitor:
 
             await self.client.run_until_disconnected()
             return True
-
         except Exception as e:
-            current_time = self.get_beijing_time()
-            log(f"监控过程中发生错误: {e} | 时间: {current_time} (北京时间)")
+            log(f"监控过程中发生错误: {e}")
             return False
         finally:
             if self.client:
@@ -349,7 +332,6 @@ class TelegramBotMonitor:
 
 # ========== HTTP 状态服务 ==========
 class StatusHandler(http.server.BaseHTTPRequestHandler):
-    # 通过类属性传递密码，在启动服务器前设置
     web_passwd = None
 
     def do_GET(self):
@@ -357,14 +339,12 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         if parsed_path.path == '/status':
             qs = parse_qs(parsed_path.query)
             pass_input = qs.get('pass', [None])[0]
-
             if self.web_passwd and pass_input != self.web_passwd:
                 self.send_response(200)
                 self.send_header('Content-type', 'text/plain; charset=utf-8')
                 self.end_headers()
                 self.wfile.write("密码错误，拒绝访问\n".encode('utf-8'))
                 return
-
             self.send_response(200)
             self.send_header('Content-type', 'text/plain; charset=utf-8')
             self.end_headers()
@@ -381,7 +361,6 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'Not Found')
 
     def log_message(self, format, *args):
-        # 抑制 HTTP 服务器自身的访问日志，避免干扰主日志
         pass
 
 
@@ -396,9 +375,7 @@ def start_http_server(web_passwd):
 async def main():
     absolute_path = os.path.abspath(__file__)
     directory_path = os.path.dirname(absolute_path)
-
     json_config_file = os.path.join(directory_path, "delebot.json")
-
     if os.path.exists(json_config_file):
         config_file = json_config_file
         log(f"使用配置文件: {config_file}")
@@ -406,7 +383,6 @@ async def main():
         log(f"配置文件不存在: {json_config_file}")
         return
 
-    # 提前读取密码
     try:
         with open(config_file, 'r', encoding='utf-8') as f:
             config = json.load(f)
@@ -414,20 +390,16 @@ async def main():
     except:
         web_passwd = ''
 
-    # 启动 HTTP 状态服务线程
     http_thread = threading.Thread(target=start_http_server, args=(web_passwd,), daemon=True)
     http_thread.start()
 
     monitor = TelegramBotMonitor(config_file)
-
     try:
         await monitor.start_monitoring()
     except KeyboardInterrupt:
-        current_time = monitor.get_beijing_time()
-        log(f"\n👋 监控程序被用户中断 | 时间: {current_time} (北京时间)")
+        log(f"\n👋 监控程序被用户中断 | 时间: {monitor.get_beijing_time()}")
     except Exception as e:
-        current_time = monitor.get_beijing_time()
-        log(f"❌ 程序运行异常: {e} | 时间: {current_time} (北京时间)")
+        log(f"❌ 程序运行异常: {e} | 时间: {monitor.get_beijing_time()}")
     finally:
         await monitor.cleanup()
 
@@ -435,5 +407,4 @@ async def main():
 if __name__ == "__main__":
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
     asyncio.run(main())
