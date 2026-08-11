@@ -170,32 +170,21 @@ class TelegramBotMonitor:
                 log(f"定时清理出错: {e}")
 
     # ==================== 新增功能：踢除非管理员邀请的机器人 ====================
+
     async def handle_new_member(self, event):
-        """
-        当有新成员加入群组时，如果是机器人且邀请者不是管理员，则踢出该机器人
-        """
-        # 只处理群聊中的加入事件
-        if not event.is_group:
+        """当有新成员加入群组时，如果是机器人且邀请者不是管理员，则踢出"""
+        # 只处理群聊，并且必须有明确的添加者（排除自己加入的情况）
+        if not event.is_group or not event.added_by:
             return
 
-        # 只关注加入的新成员（包括自己加入）
-        if not event.added_by:
-            return
+        chat = await event.get_chat()
+        inviter = await self.client.get_entity(event.added_by)
 
-        # 获取新加入的成员列表
-        for user in event.added_users:
+        for user in event.users:
             if not user.bot:
-                continue  # 不是机器人，忽略
+                continue  # 忽略非机器人
 
-            chat = await event.get_chat()
-            inviter_id = event.added_by
-            try:
-                inviter = await self.client.get_entity(inviter_id)
-            except:
-                log(f"无法获取邀请者信息: {inviter_id}")
-                continue
-
-            # 检查邀请者是否是管理员
+            # 检查邀请者是否为管理员
             try:
                 admins = await self.client.get_participants(chat, filter=ChannelParticipantsAdmins)
                 admin_ids = [admin.id for admin in admins]
@@ -205,7 +194,6 @@ class TelegramBotMonitor:
                 continue
 
             if not is_inviter_admin:
-                # 不是管理员邀请的机器人，执行踢出
                 try:
                     await self.client.kick_participant(chat, user)
                     log(f"✅ 已踢出非管理员邀请的机器人: @{user.username or user.id} (邀请者: @{inviter.username or inviter.id})")
@@ -213,6 +201,8 @@ class TelegramBotMonitor:
                     log(f"❌ 无权限踢人，请确保本机器人是群组管理员且有封禁权限")
                 except Exception as e:
                     log(f"❌ 踢出机器人失败: {e}")
+
+
     # ========================================================================
 
     async def handle_bot_message(self, event):
@@ -282,6 +272,8 @@ class TelegramBotMonitor:
             await self.client.send_message(event.chat_id, notification_text)
         except Exception as e:
             log(f"发送删除通知失败: {e}")
+
+
 
     async def start_monitoring(self):
         try:
