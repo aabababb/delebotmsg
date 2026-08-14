@@ -136,8 +136,30 @@ class TelegramBotMonitor:
             log(f"检查提及失败: {e}")
         return False
 
+    # ============ 新增辅助方法：检查用户是否是群组管理员 ============
+    async def is_user_admin(self, chat, user_id):
+        """判断指定用户是否为群组管理员"""
+        try:
+            admins = await self.client.get_participants(chat, filter=ChannelParticipantsAdmins)
+            return any(admin.id == user_id for admin in admins)
+        except Exception as e:
+            log(f"获取管理员列表失败: {e}")
+            return False
+
+    # ============ 新增辅助方法：封禁机器人 ============
+    async def ban_bot(self, chat, user):
+        """封禁机器人，禁止其查看消息（等效于 ban）"""
+        try:
+            await self.client.edit_permissions(chat, user, view_messages=False)
+            return True
+        except errors.ChatAdminRequiredError:
+            log("❌ 本账号不是管理员或缺少封禁权限，无法 ban 机器人")
+            return False
+        except Exception as e:
+            log(f"❌ 封禁机器人失败: {e}")
+            return False
+
     async def handle_system_message_once(self):
-        """定时清理系统消息（入群/退群等）"""
         log("开始定时清理系统消息...")
         async for dialog in self.client.iter_dialogs(limit=100):
             current_time = self.get_beijing_time()
@@ -169,25 +191,26 @@ class TelegramBotMonitor:
             except Exception as e:
                 log(f"定时清理出错: {e}")
 
-    # ==================== 新增功能：踢除非管理员邀请的机器人 ====================
-
     async def handle_new_member(self, event):
         """当有新成员加入群组时，如果是机器人且邀请者不是管理员，则踢出"""
-        # 只处理群聊，并且必须有明确的添加者（排除自己加入的情况）
-        if not event.is_group or not event.added_by:
+        if not event.is_group or not event.added_by or not event.users:
+            return
+        if not (event.user_added or event.user_joined):
             return
 
         chat = await event.get_chat()
-        inviter = await self.client.get_entity(event.added_by)
+        try:
+            inviter = await self.client.get_entity(event.added_by)
+        except Exception as e:
+            log(f"无法获取邀请者信息: {e}")
+            return
 
         for user in event.users:
             if not user.bot:
-                continue  # 忽略非机器人
-
-            # 检查邀请者是否为管理员
+                continue
             try:
                 admins = await self.client.get_participants(chat, filter=ChannelParticipantsAdmins)
-                admin_ids = [admin.id for admin in admins]
+                admin_ids = [admin.id for admin in admins] if admins else []
                 is_inviter_admin = inviter.id in admin_ids
             except Exception as e:
                 log(f"获取管理员列表失败: {e}")
@@ -197,13 +220,8 @@ class TelegramBotMonitor:
                 try:
                     await self.client.kick_participant(chat, user)
                     log(f"✅ 已踢出非管理员邀请的机器人: @{user.username or user.id} (邀请者: @{inviter.username or inviter.id})")
-                except errors.ChatAdminRequiredError:
-                    log(f"❌ 无权限踢人，请确保本机器人是群组管理员且有封禁权限")
                 except Exception as e:
                     log(f"❌ 踢出机器人失败: {e}")
-
-
-    # ========================================================================
 
     async def handle_bot_message(self, event):
         async with self.semaphore:
@@ -211,6 +229,26 @@ class TelegramBotMonitor:
             try:
                 if event.out:
                     return
+
+                # ============ 新增功能：处理群组内非管理员机器人消息 ============
+                if event.is_group and self.config.get("ban_non_admin_bots", True):
+                    sender = await event.get_sender()
+                    if sender and getattr(sender, 'bot', False):
+                        # 检查该机器人是否是管理员
+                        if not await self.is_user_admin(event.chat_id, sender.id):
+                            log(f"🚨 检测到非管理员机器人发消息，立即删除并封禁: @{sender.username or sender.id}")
+                            # 删除消息
+                            try:
+                                await self.client.delete_messages(event.chat_id, event.message.id)
+                                log("✅ 消息已删除")
+                            except Exception as e:
+                                log(f"❌ 删除消息失败: {e}")
+                            # 封禁机器人
+                            if await self.ban_bot(event.chat_id, sender):
+                                log(f"✅ 已封禁机器人 @{sender.username or sender.id}")
+                            return  # 不再走原有删除逻辑
+
+                # ============ 原有删除逻辑 ============
                 result = await self.should_delete_message(event)
                 if isinstance(result, tuple) and len(result) == 3:
                     should_delete, reason, delay_seconds = result
@@ -273,30 +311,26 @@ class TelegramBotMonitor:
         except Exception as e:
             log(f"发送删除通知失败: {e}")
 
-
-
     async def start_monitoring(self):
         try:
             if not await self.initialize_client():
                 return False
 
-            # 原有机器人消息处理器
             self.client.add_event_handler(
                 self.handle_bot_message,
                 events.NewMessage(incoming=True)
             )
 
-            # ========== 新增事件处理器：新成员加入 ==========
-            # 根据配置决定是否启用踢出非管理员邀请的机器人（默认开启）
             if self.config.get("kick_unauthorized_bots", True):
                 self.client.add_event_handler(
                     self.handle_new_member,
-                    events.ChatAction
+                    events.ChatAction(func=lambda e: e.user_added or e.user_joined)
                 )
                 log("已启用「踢除非管理员邀请的机器人」功能")
-            # ===============================================
 
-            # 后台定时系统消息清理
+            if self.config.get("ban_non_admin_bots", True):
+                log("已启用「群组内非管理员机器人消息删除并封禁」功能")
+
             asyncio.create_task(self.periodic_system_cleanup())
 
             current_time = self.get_beijing_time()
@@ -314,8 +348,7 @@ class TelegramBotMonitor:
             log(f"监控过程中发生错误: {e}")
             return False
         finally:
-            if self.client:
-                await self.client.disconnect()
+            await self.cleanup()
 
     async def cleanup(self):
         if self.client:
