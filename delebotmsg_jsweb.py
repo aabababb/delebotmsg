@@ -148,9 +148,11 @@ class TelegramBotMonitor:
 
     # ============ 新增辅助方法：封禁机器人 ============
     async def ban_bot(self, chat, user):
-        """封禁机器人，禁止其查看消息（等效于 ban）"""
+        """封禁机器人，禁止其查看消息"""
         try:
-            await self.client.edit_permissions(chat, user, view_messages=False)
+            # 先获取完整实体，避免 PeerUser 无法解析的问题
+            entity = await self.client.get_entity(user)
+            await self.client.edit_permissions(chat, entity, view_messages=False)
             return True
         except errors.ChatAdminRequiredError:
             log("❌ 本账号不是管理员或缺少封禁权限，无法 ban 机器人")
@@ -158,6 +160,7 @@ class TelegramBotMonitor:
         except Exception as e:
             log(f"❌ 封禁机器人失败: {e}")
             return False
+
 
     async def handle_system_message_once(self):
         log("开始定时清理系统消息...")
@@ -391,7 +394,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
 
 def start_http_server(web_passwd):
     StatusHandler.web_passwd = web_passwd
-    port = int(os.environ.get('PORT', 10000))
+    port = int(os.environ.get('PORT', 20000))
     server = http.server.HTTPServer(('0.0.0.0', port), StatusHandler)
     log(f"HTTP 状态服务已启动，监听 0.0.0.0:{port}，访问 /status?pass=你的密码")
     server.serve_forever()
