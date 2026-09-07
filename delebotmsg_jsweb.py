@@ -147,12 +147,18 @@ class TelegramBotMonitor:
             return False
 
     # ============ 新增辅助方法：封禁机器人 ============
+
     async def ban_bot(self, chat, user):
-        """封禁机器人，禁止其查看消息"""
         try:
-            # 先获取完整实体，避免 PeerUser 无法解析的问题
-            entity = await self.client.get_entity(user)
-            await self.client.edit_permissions(chat, entity, view_messages=False)
+            try:
+                input_entity = await self.client.get_input_entity(user.id)
+            except:
+                username = getattr(user, 'username', None)
+                if username:
+                    input_entity = await self.client.get_input_entity(username)
+                else:
+                    raise
+            await self.client.edit_permissions(chat, input_entity, view_messages=False)
             return True
         except errors.ChatAdminRequiredError:
             log("❌ 本账号不是管理员或缺少封禁权限，无法 ban 机器人")
@@ -160,7 +166,6 @@ class TelegramBotMonitor:
         except Exception as e:
             log(f"❌ 封禁机器人失败: {e}")
             return False
-
 
     async def handle_system_message_once(self):
         log("开始定时清理系统消息...")
